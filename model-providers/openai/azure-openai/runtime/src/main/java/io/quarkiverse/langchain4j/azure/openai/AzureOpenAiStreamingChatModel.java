@@ -3,14 +3,25 @@ package io.quarkiverse.langchain4j.azure.openai;
 import static dev.langchain4j.internal.Utils.getOrDefault;
 import static dev.langchain4j.internal.Utils.isNullOrEmpty;
 import static dev.langchain4j.internal.ValidationUtils.ensureNotBlank;
+import static dev.langchain4j.model.openai.InternalOpenAiHelper.aiMessageFrom;
+import static dev.langchain4j.model.openai.InternalOpenAiHelper.finishReasonFrom;
 import static dev.langchain4j.model.openai.InternalOpenAiHelper.toFunctions;
 import static dev.langchain4j.model.openai.InternalOpenAiHelper.toOpenAiMessages;
+import static dev.langchain4j.model.openai.InternalOpenAiHelper.tokenUsageFrom;
 import static io.quarkiverse.langchain4j.azure.openai.Consts.DEFAULT_USER_AGENT;
 import static java.time.Duration.ofSeconds;
+import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 
+import dev.langchain4j.model.chat.listener.ChatModelErrorContext;
+import dev.langchain4j.model.chat.listener.ChatModelListener;
+import dev.langchain4j.model.chat.listener.ChatModelRequest;
+import dev.langchain4j.model.chat.listener.ChatModelRequestContext;
+import dev.langchain4j.model.chat.listener.ChatModelResponse;
+import dev.langchain4j.model.chat.listener.ChatModelResponseContext;
 import java.net.Proxy;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -31,6 +42,10 @@ import dev.langchain4j.model.chat.TokenCountEstimator;
 import dev.langchain4j.model.openai.OpenAiStreamingResponseBuilder;
 import dev.langchain4j.model.output.Response;
 import io.quarkiverse.langchain4j.openai.common.QuarkusOpenAiClient;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import org.jboss.logging.Logger;
 
 /**
  * Represents an OpenAI language model, hosted on Azure, that has a chat completion interface, such as gpt-3.5-turbo.
@@ -54,6 +69,8 @@ import io.quarkiverse.langchain4j.openai.common.QuarkusOpenAiClient;
  */
 public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel, TokenCountEstimator {
 
+    private static final Logger log = Logger.getLogger(AzureOpenAiStreamingChatModel.class);
+
     private final OpenAiClient client;
     private final Double temperature;
     private final Double topP;
@@ -62,8 +79,10 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
     private final Double frequencyPenalty;
     private final Tokenizer tokenizer;
     private final ResponseFormat responseFormat;
+  private final List<ChatModelListener> listeners;
 
-    public AzureOpenAiStreamingChatModel(String endpoint,
+
+  public AzureOpenAiStreamingChatModel(String endpoint,
             String apiVersion,
             String apiKey,
             String adToken,
@@ -78,7 +97,10 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
             String responseFormat,
             Boolean logRequests,
             Boolean logResponses,
-            String configName) {
+            String configName,
+            List<ChatModelListener> listeners) {
+
+        this.listeners = listeners == null ? emptyList() : new ArrayList<>(listeners);
 
         timeout = getOrDefault(timeout, ofSeconds(60));
 
@@ -160,7 +182,13 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
 
         OpenAiStreamingResponseBuilder responseBuilder = new OpenAiStreamingResponseBuilder();
 
-        client.chatCompletion(request)
+        ChatModelRequest modelListenerRequest = createModelListenerRequest(request, messages, toolSpecifications);
+        Map<Object, Object> attributes = new ConcurrentHashMap<>();
+        ChatModelRequestContext requestContext = new ChatModelRequestContext(modelListenerRequest, attributes);
+
+      callListeners(listener -> listener.onRequest(requestContext));
+
+      client.chatCompletion(request)
                 .onPartialResponse(partialResponse -> {
                     responseBuilder.append(partialResponse);
                     handle(partialResponse, handler);
@@ -168,9 +196,68 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
                 .onComplete(() -> {
                     Response<AiMessage> response = responseBuilder.build();
                     handler.onComplete(response);
+
+                  ChatModelResponse modelListenerResponse = createModelListenerResponse(
+                      "1", //it should be the partialResponse.id() but it is not available
+                      request.model(), //it should be the partialResponse.model() but it is also not available
+                      response);
+                  ChatModelResponseContext responseContext = new ChatModelResponseContext(
+                      modelListenerResponse,
+                      modelListenerRequest,
+                      attributes);
+                  callListeners(listener -> listener.onResponse(responseContext));
                 })
-                .onError(handler::onError)
+                .onError(error -> {
+                  handler.onError(error);
+
+                  ChatModelErrorContext errorContext = new ChatModelErrorContext(
+                      error,
+                      modelListenerRequest,
+                      null,
+                      attributes);
+
+                  callListeners(listener -> listener.onError(errorContext));
+                })
                 .execute();
+    }
+
+    private ChatModelRequest createModelListenerRequest(ChatCompletionRequest request,
+                                                        List<ChatMessage> messages,
+                                                        List<ToolSpecification> toolSpecifications) {
+      return ChatModelRequest.builder()
+          .model(request.model())
+          .temperature(request.temperature())
+          .topP(request.topP())
+          .maxTokens(request.maxTokens())
+          .messages(messages)
+          .toolSpecifications(toolSpecifications)
+          .build();
+    }
+
+    private ChatModelResponse createModelListenerResponse(String responseId,
+                                                          String responseModel,
+                                                          Response<AiMessage> response) {
+      if (response == null) {
+        return null;
+      }
+
+      return ChatModelResponse.builder()
+          .id(responseId)
+          .model(responseModel)
+          .tokenUsage(response.tokenUsage())
+          .finishReason(response.finishReason())
+          .aiMessage(response.content())
+          .build();
+    }
+
+    private void callListeners(Consumer<ChatModelListener> listenerConsumer) {
+        listeners.forEach(listener -> {
+            try {
+                listenerConsumer.accept(listener);
+            } catch (Exception e) {
+                log.warn("Exception while calling model listener", e);
+            }
+        });
     }
 
     private static void handle(ChatCompletionResponse partialResponse,
@@ -213,6 +300,7 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
         private Boolean logRequests;
         private Boolean logResponses;
         private String configName;
+        private List<ChatModelListener> listeners;
 
         /**
          * Sets the Azure OpenAI endpoint. This is a mandatory parameter.
@@ -313,6 +401,11 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
             return this;
         }
 
+        public Builder listeners(List<ChatModelListener> listeners) {
+          this.listeners = listeners;
+          return this;
+        }
+
         public AzureOpenAiStreamingChatModel build() {
             return new AzureOpenAiStreamingChatModel(endpoint,
                     apiVersion,
@@ -329,7 +422,8 @@ public class AzureOpenAiStreamingChatModel implements StreamingChatLanguageModel
                     responseFormat,
                     logRequests,
                     logResponses,
-                    configName);
+                    configName,
+                    listeners);
         }
     }
 }
